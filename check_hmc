@@ -1,0 +1,878 @@
+#!/usr/bin/perl -sW
+#
+# This is a nagios script will SSH into an HMC, run some commands, then alert on any problems found.
+
+
+# CHANGE LOG
+# ----------
+#  2010/06/09	njeffrey	Script created
+#  2012/12/24	njeffrey	Add get_hmc_version subroutine
+#  2012/12/24	njeffrey	Cleanup of variable names
+#  2012/12/24	njeffrey	Add workaround for bug in monhmc command on HMC code level V7R7.5.0.0
+#  2013/09/12	njeffrey	Add check to confirm HMC performance data collection is enabled
+#  2013/09/12	njeffrey	Ping each DNS server to ensure it is available
+#  2014/10/10	njeffrey	Confirm that the HMC is authenticated on each managed system
+#  2015/06/09	njeffrey	Rewrite using Net::SSH::Perl module instead of Net::OpenSSH (because Net::OpenSSH stopped building on AIX)
+#  2015/06/09	njeffrey	Add assorted error checks, documentation
+#  2016/03/18	njeffrey	Rewrite using system calls to /usr/bin/ssh (because Net::SSH::Perl requires a C compiler on AIX)
+#  2017/04/09	njeffrey	Ignore bogus message from VIOS about low filesystem space
+#  2017/04/13	njeffrey	Automatically close bogus message from VIOS about low filesystem space
+
+
+# OUTSTANDING TASKS
+# -----------------
+# 1) This script will generate an alert on the first error it finds, so it may miss other errors.
+#    Consider storing all errors in an array, then reporting on multiple errors at the end of the script.
+# 2) Ping each of the NTP servers to ensure they respond
+# 3) In the  check_hmc_remote_access_settings subroutine, add a section to check for remote console window
+
+#
+#
+# PREREQUISITES
+# -------------
+#
+#   1) It is assumed that this script is run on the nagios server as the "nagios" userid
+#
+#   2) You will need to setup preshared SSH key pairs between the nagios server
+#      and each HMC you want to monitor.  
+#      An example is shown below:
+#        On nagios server:
+#        ----------------    
+#           su - nagios
+#           ssh-keygen -t dsa
+#           cat $HOME/.ssh/id_dsa.pub
+#
+#        On each HMC
+#        -----------
+#           ssh hscroot@hmc "mkauthkeys --add 'public_key_string_goes_here'"
+#
+#   3) You will need to manually ssh from the nagios server to each monitored HMC to update 
+#      the known_hosts file on the nagios server.  Example shown below:
+#         $ ssh hscroot@hmc01
+#         WARNING: DSA key found for host hmc01
+#         in /home/nagios/.ssh/known_hosts2:3
+#         DSA key fingerprint d6:74:15:62:f3:09:31:09:65:a2:23:56:4b:e0:6b:16.
+#         The authenticity of host 'hmc01 (10.0.0.42)' can't be established
+#         but keys of different type are already known for this host.
+#         RSA key fingerprint is ea:a1:05:58:8d:4e:4e:c4:82:db:cf:87:75:a6:7c:7f.
+#         Are you sure you want to continue connecting (yes/no)? yes
+#         Warning: Permanently added 'unix07,10.0.0.42' (RSA) to the list of known hosts.
+#
+#
+#
+#   4) You will need a section similar to the following in the commands.cfg file on the nagios server.
+#      This defines the check_hmc command.
+#
+#      # 'check_hmc' command definition
+#      define command{
+#         command_name    check_hmc
+#         command_line    $USER1$/check_hmc $HOSTADDRESS$
+#      }
+
+
+
+#
+#
+# TROUBLESHOOTING
+# ---------------
+# 1) Confirm you can ssh from the nagios server to each monitored HMC without a password
+#    
+# 2) Confirm there are no firewalls preventing ssh logins from the nagios server to the HMC hosts
+#    
+#
+#    
+#
+# Usage:       /usr/local/nagios/libexec/check_hmc hostname
+#
+
+
+
+
+
+
+use strict;							#enforce good coding practices
+
+
+my (%managed_sys,$managed_sys_num,$key,$host);
+my ($ssh,$ssh_userid);
+my ($verbose);
+my ($nslookup,$nslookup_status,$ping,$ping_status,$cmd);
+my (%fsp,$fsp,$hmc_version,@nameservers);
+my ($cpu_user,$cpu_sys,$cpu_nice,$cpu_idle,$cpu_wait,$cpu_count,$mem_free,$mem_used,$mem_total);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
+
+#declare variables
+%managed_sys       = ();					#initialize hash that will hold details of each managed sys
+$managed_sys_num   = 0;						#initialize variable for number of managed systems
+$key               = "";					#initialize variable
+$host              = "";					#initialize variable
+$ssh               = "/usr/bin/ssh";       		        #location of ssh binary
+$ssh_userid        = "hscroot";                     		#username passed to remote host
+$nslookup          = "/usr/bin/nslookup";			#location of binary on nagios server
+$ping              = "/bin/ping";				#location of binary on nagios server
+$nslookup_status   = "";					#flag for checking to see if nslookup test succeeds
+$ping_status       = "";					#flag for checking to see if ping     test succeeds
+$verbose           = "no";					#for debugging (yes=show more print output) 
+$fsp               = "";					#scratch variable for IP address of Flexible Service Proc
+$cpu_user          = 0; 					#initialize variable
+$cpu_sys           = 0; 					#initialize variable
+$cpu_nice          = 0; 					#initialize variable
+$cpu_idle          = 0; 					#initialize variable
+$cpu_wait          = 0; 					#initialize variable
+$cpu_count         = 0;						#initialize variable
+$CHECK_NAME        = "HMC checks"; 				#name of nagios check
+#
+# Nagios return codes
+#
+$OK=            0;                            		  	#this script returns a value to nagios for processing
+$WARN=          1;                          		    	#this script returns a value to nagios for processing
+$CRITICAL=      2;                              		#this script returns a value to nagios for processing
+$UNKNOWN=       3;                              		#this script returns a value to nagios for processing
+
+
+
+
+sub sanity_checks {
+   # 
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   # 
+   # confirm user specified a command line parameter
+   #  
+   if( ! defined( $ARGV[0] ) ) {
+      print "$CHECK_NAME CRITICAL  - no HMC hostname supplied.  USAGE: $0 hmc_host_name \n";
+      exit $CRITICAL;
+   }						#end of if block
+   if( defined( $ARGV[0] ) ) {
+      $host = $ARGV[0];				#assign meaningful variable name
+   }						#end of if block
+   #
+   # confirm nslookup exists
+   if ( ! -f "$nslookup" ) {
+      print "ERROR: Cannot find $nslookup \n";
+      exit;					#exit script
+   }						#end of if block
+   if ( ! -x "$nslookup" ) {
+      print "ERROR: $nslookup is not executable by the current user\n";
+      exit;					#exit script
+   }						#end of if block
+   #
+   # confirm ping exists
+   $ping = "/bin/ping" if (-f "/bin/ping");	#location on Linux
+   $ping = "/etc/ping" if (-f "/etc/ping");	#location on AIX
+   if ( ! -f "$ping" ) {
+      print "ERROR: Cannot find $ping \n";
+      exit;					#exit script
+   }						#end of if block
+   if ( ! -x "$ping" ) {
+      print "ERROR: $ping is not executable by the current user\n";
+      exit;					#exit script
+   }						#end of if block
+   #
+   # confirm ssh exists
+   if ( ! -f "$ssh" ) {
+      print "$CHECK_NAME WARN: Cannot find $ssh \n";
+      exit $WARN;                                       #exit script
+   }                                            #end of if block
+   if ( ! -x "$ssh" ) {
+      print "$CHECK_NAME WARN: $ssh is not executable by the current user\n";
+      exit $WARN;                               #exit script
+   }                                            #end of if block
+}						#end of subroutine
+
+
+
+
+
+sub check_host_alive {   
+   #
+   print "running check_host_alive subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm valid name resolution exists for $host
+   #
+   if( ! open( NSLOOKUP, "$nslookup $host 2>&1|" ) ) {
+      warn "WARNING: nslookup $host failed: $!\n";
+      return 0;
+   }
+   while (<NSLOOKUP>) {                        					#read a line from STDIN
+      if (/failed/) {								#look for error message from nslookup
+         $nslookup_status = "failed";						#set flag value for $nslookup variable
+      }										#end of if block
+      if (/SERVFAIL/) {								#look for error message from nslookup
+         $nslookup_status = "failed";						#set flag value for $nslookup variable
+      }										#end of if block
+   }										#end of while loop
+   close NSLOOKUP;								#close filehandle
+   if ( $nslookup_status eq "failed" ) {					#check for flag value
+      print "$CHECK_NAME CRITICAL: no name resolution for $host - please add $host to DNS \n";
+      exit $CRITICAL;
+   }										#end of if block
+   #
+   # ping remote hostname 
+   #
+   $ping_status = "";								#initialize variable
+   if( ! open( PING, "$ping -c 1 $host |" ) ) {
+      print "$CHECK_NAME CRITICAL - Could not ping $host because: $!\n";
+      exit $CRITICAL;
+   }
+   while (<PING>) {								#read a line from STDIN
+      $ping_status = "failed" if ( /100% packet loss/ ); 			#look for timeout message for UNIX ping
+      $ping_status = "failed" if ( /100% loss/ ); 				#look for timeout message for Windows ping
+   }										#end of while loop
+   close PING;									#close filehandle
+   if ( $ping_status eq "failed" ) {						#check for flag value
+      print "$CHECK_NAME CRITICAL - No ping reply from $host $!\n";
+      exit $CRITICAL;
+   }										#end of if block
+}
+
+
+
+
+
+
+sub ssh_to_hmc {
+   #
+   print "running ssh_to_hmc subroutine \n" if ($verbose eq "yes");
+   #
+   # This subroutine is used to verify that we can successfully login to the HMC.
+   # If this does not work, we probably forgot to setup the SSH host keys from the nagios box to the HMC.
+   #
+   $cmd = "$ssh $ssh_userid\@$host lshmc -v";                 #define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      unless ( /[a-zA-Z0-9\"\*]+/ ) {				#look for some output to confirm the SSH login worked
+         print "$CHECK_NAME WARN - Could not login to the HMC via SSH.  Please confirm SSH key pairs setup with the mkauthkeys command on the HMC.\n";
+         exit $WARN;
+      } 							#end of if block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+}								#end of subroutine
+
+
+
+
+
+
+
+sub get_hmc_version {
+   #
+   # figure out the code level running on the HMC 
+   #
+   # The "lshmc -v" command will return output similar to the following:
+   #   hscroot@hmc01:~> lshmc -F -v
+   #   "*FC ????????
+   #   *VC 20.0
+   #   *N2 Mon Dec 24 10:27:49 MST 2012
+   #   *FC ????????
+   #   *DS Hardware Management Console
+   #   *TM eserver xSeries 335 -[7310CR2]-
+   #   *SE 1053XXX
+   #   *MN IBM
+   #   *PN Unknown
+   #   *SZ 1053347840
+   #   *OS Embedded Operating Systems
+   #   *NA 192.168.128.1
+   #   *FC ????????
+   #   *DS Platform Firmware
+   #   *RM V7R7.5.0.0            <--------- this is the code level of the HMC
+   # "
+   #
+   print "running get_hmc_version subroutine \n" if ($verbose eq "yes");
+   #
+   $cmd = "$ssh $ssh_userid\@$host lshmc -v";                 #define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      chomp $_;							#remove newline character from array element
+      if ( /^\*RM V([0-9]+)R([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/ ) {	#find the line containing the HMC code level
+      $hmc_version = "$1$2$3$4$5";				#change format from V7R7.5.0.0 to 77500 to make it easier to do math against the version number
+      } 							#end of if block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+   #
+   # warn if HMC version was not found
+   if ( ! defined ($hmc_version) ) {				#could not find HMC version
+      print "$CHECK_NAME WARN - Could not determine HMC software version from output of lshmc -v command. \n";
+      exit $WARN;
+   }								#end of if block
+}								#end of subroutine
+
+
+
+
+
+sub get_managed_system_names {
+   # 
+   # figure out the managed systems connected to this HMC and stick in an array
+   # 
+   print "running get_managed_system_names subroutine \n" if ($verbose eq "yes");
+   # 
+   # You will see output similar to the following:
+   # 8284-22A*21505DW
+   # 8231-E1C*06C4C5R
+   # 8202-E4C*06C4B9R
+   #
+   $cmd = "$ssh $ssh_userid\@$host lssysconn -r all -F type_model_serial_num";                 #define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      if ( /([a-zA-Z0-9_\-\*]+)/ ) {				#each line will be a different managed system
+      $managed_sys{$1}{name} = $1;				#add to hash
+      } 							#end of if block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+   #
+   # figure out how many managed systems are connected to the HMC
+   $managed_sys_num = keys %managed_sys;  
+   #
+   # warn if there are no managed systems detected
+   if ( $managed_sys_num == 0 ) {				#zero managed systems were detected
+      print "$CHECK_NAME WARN - $managed_sys_num managed systems were detected on $host.  The HMC may have lost communication with the managed systems over the private network. \n";
+      exit $WARN;
+   }								#end of if block
+   #
+   # Warn if the HMC is not authenticated to any of the managed systems.
+   # This will happen if a brand new managed system is added, or possibly if the HMC code is updated.
+   # 
+   # You should get output similar to the following:
+   # hscroot@hmc2:~> lssysconn -r all -F type_model_serial_num,state
+   # 8231-E1C*06C4XXX,Failed Authentication
+   # 8231-E1C*06C4YYY,No Connection
+   # 8231-E1C*06C4YYY,No Connection
+   # 8202-E4C*06C4XXX,No Connection
+   # 8202-E4C*06C4XXX,No Connection
+   # 8202-E4C*06C4YYY,Failed Authentication
+   #
+   #
+   $cmd = "$ssh $ssh_userid\@$host lssysconn -r all -F type_model_serial_num,state";                 #define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      if ( /([a-zA-Z0-9_\-\*]+),Failed Authentication/ ) {	#look for systems with Failed Authentication
+         print "$CHECK_NAME WARN - The HMC has not authenticated with managed system $1.  The managed system might be new, or the HMC may have recently had a code update.  Open the HMC interface, right click on this managed system, then enter the authentication password. \n";
+         exit $WARN;
+      } 							#end of if block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+}								#end of subroutine
+
+
+
+
+
+
+sub check_dns {
+   #
+   print "running check_dns subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm HMC is configured to use DNS for name resolution
+   #
+   # You should see output similar to the following:
+   # 172.24.1.158,172.24.1.246,172.24.1.247
+   $cmd = "$ssh $ssh_userid\@$host lshmc -n -F nameserver";     #define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      if ( /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ ) {			#find at least one DNS server
+         chomp;							#remove newline
+         print "   found nameservers $_ \n" if ($verbose eq "yes");
+         @nameservers = split (/,/,$_); 			#put each nameserver into an array element
+      }								#end of if block
+      unless ( /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ ) {		#if there are no DNS servers defined
+         print "$CHECK_NAME WARN - $host is not configured to use DNS for name resolution.  Please add name servers to $host \n";
+         exit $WARN;
+      }								#end of unless block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+   #
+   # attempt to ping each nameserver
+   # You should get a ping reply that looks similar to the following:
+   #1 packets transmitted, 1 received, 0% packet loss, time 0ms
+   #
+   foreach (@nameservers) {						#loop through for each nameserver
+      $cmd = "$ssh $ssh_userid\@$host ping -c 1 $_ | grep transmitted";	#define command to be run 
+      print "   running $cmd \n" if ($verbose eq "yes");
+      open(SSH,"$cmd |") or die "$!\n";
+      while (<SSH>) {
+         if ( /0 received/ ) {						#look for ping reply from DNS server
+            print "$CHECK_NAME WARN - no ping reply from $host to DNS server $_.  Please check to confirm the HMC is using valid nameservers.\n";
+            exit $WARN;
+         } elsif ( /1 received/ ) {
+            print "   received ping reply from DNS server \n" if ($verbose eq "yes");
+         } else {
+            print "$CHECK_NAME WARN - did not recognize response to ping sent to DNS server \n";
+            exit $WARN;
+         } 								#end of if/elsif/else block
+      } 								#end of while loop
+      close SSH; 							#close filehandle
+   }									#end of foreach loop
+}									#end of subroutine
+
+
+
+
+
+sub check_hostname {
+   #
+   print "running check_hostname subroutine \n"      if ($verbose eq "yes");
+   #
+   # confirm HMC has a valid hostname
+   #
+   $cmd = "$ssh $ssh_userid\@$host lshmc -n -F hostname";                 #define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      if ( /([a-zA-Z0-9\-]+)/ ) {					#find the hostname
+         print "   found hostname $1 \n" if ($verbose eq "yes");
+      }								#end of if block
+      if ( /\./ ) {						#look for a . character in hostname
+         print "$CHECK_NAME WARN - $host hostname contains a dot (.) character.  The dot should be in the domain name.\n";
+         exit $WARN;
+      }								#end of if block
+      unless ( /[a-zA-Z0-9\-]+/ ) {
+         print "$CHECK_NAME WARN - $host does not have a hostname configured.  Please fix up in HMC config.\n";
+         exit $WARN;
+      }								#end of unless block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+}								#end of subroutine
+
+
+
+
+sub check_time_sync {
+   #
+   print "running check_time_sync subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm HMC synchronizes time against an NTP server
+   #
+   # check to see if NTP protocol is enabled
+   $cmd = "$ssh $ssh_userid\@$host lshmc -r -F xntp";		#define command to be run 
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      unless ( /enable/ ) {					#check to see if ntp is enabled
+         print "$CHECK_NAME WARN - $host does not have xntp enabled, so HMC is not synchronizing time against an NTP server.\n";
+         exit $WARN;
+      }								#end of if block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+   #
+   #
+   #
+   # look for list of NTP servers
+   $cmd = "$ssh $ssh_userid\@$host lshmc -r -F xntpserver";	#define command to be run 
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      if ( /[a-zA-Z0-9]+/ ) {					#check to see if ntp is enabled
+         chomp;							#remove newline
+         print "   found NTP server $_ \n" if ($verbose eq "yes");
+      } else {							#only get here if no NTP servers were found
+         print "$CHECK_NAME WARN - $host has NTP client enabled, but does not have a list of NTP servers to sync time against.\n";
+         exit $WARN;
+      }								#end of if/else block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+}								#end of subroutine
+
+
+
+
+
+
+sub check_hmc_remote_access_settings {
+   #
+   print "running check_hmc_remote_access_settings subroutine \n"      if ($verbose eq "yes");
+   #
+   # confirm that remote access to the HMC via SSH is enabled
+   # Yes, I realize this is a bit silly, since this script connects to the HMC via SSH.
+   #
+   $cmd = "$ssh $ssh_userid\@$host lshmc -r -F ssh";		#define command to be run 
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      unless ( /enable/ ) {					#check to see if ntp is enabled
+         print "$CHECK_NAME WARN - $host does not permit remote access via ssh.  Please fix up on HMC console.\n";
+         exit $WARN;
+      }								#end of if block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+   #
+   #
+   #
+   # confirm that remote access to the HMC via HTTPS is enabled
+   #
+   $cmd = "$ssh $ssh_userid\@$host lshmc -r -F remotewebui";	#define command to be run 
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      unless ( /enable/ ) {					#check to see if ntp is enabled
+         print "$CHECK_NAME WARN - $host does not permit web-based remote access.  This means you cannot use your web browser to manage the HMC at https://$host.  Please fix up on HMC console.\n";
+         exit $WARN;
+      }								#end of if block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+}								#end of subroutine
+
+
+
+
+
+
+sub ping_each_managed_system_fsp {
+   #
+   print "running ping_each_managed_system_fsp subroutine \n" if ($verbose eq "yes");
+   #
+   # Send a ping from the HMC to the FSP (flexible service processor) on each managed system.
+   # If there is no ping reply, the network connection on the private subnet for the HMC and service 
+   # processors of the managed systems may be having a problem.
+   #
+   # get a list of all the service processor IP addresses
+   # You should get output similar to the following: (one line per managed system FSP)
+   #192.168.168.171
+   #192.168.128.2
+   #192.168.168.170
+   #
+   $cmd = "$ssh $ssh_userid\@$host lssysconn -r all -F ipaddr";	#define command to be run 
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      if ( /([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/ ) {		#check to see if ntp is enabled
+         print "   found managed system FSP $1 \n" if ($verbose eq "yes");
+         $fsp{$1}{ipaddr} = $1;					#add FSP IP address hash
+      }								#end of if block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+   #
+   #
+   # attempt to ping the IP address of each FSP that the HMC knows about
+   # You should get a ping reply that looks similar to the following:
+   #1 packets transmitted, 1 received, 0% packet loss, time 0ms
+   #
+   print "   pinging service processors \n" if ($verbose eq "yes");
+   foreach $key (keys %fsp) { 					#loop through for each FSP IP address
+      $cmd = "$ssh $ssh_userid\@$host ping -c 1 $key | grep transmitted";		#define command to be run 
+      print "   running $cmd \n" if ($verbose eq "yes");
+      open(SSH,"$cmd |") or die "$!\n";
+      while (<SSH>) {
+         if ( /0 received/ ) {					#look for ping reply from DNS server
+            print "$CHECK_NAME WARN - no ping reply from $host to service processor $fsp.  HMC may have lost communication with managed system over private network.\n";
+            exit $WARN;
+         } elsif ( /1 received/ ) {
+            print "   received ping reply from service processor \n" if ($verbose eq "yes");
+         } else {
+            print "$CHECK_NAME WARN - did not recognize response to ping sent to service processor \n";
+            exit $WARN;
+         } 							#end of if/elsif/else block
+      } 							#end of while loop
+      close SSH; 						#close filehandle
+   }								#end of foreach loop
+}
+
+
+
+
+
+
+sub check_hmc_cpu {
+   #
+   print "running check_hmc_cpu subroutine \n" if ($verbose eq "yes");
+   #
+   # check the CPU utilization on the HMC
+   # this will return output similar to: 
+   #   hscroot@hmc01:~> monhmc -r proc -n 0
+   #   Cpu0  :  1.7%us,  0.3%sy,  0.0%ni, 98.0%id,  0.0%wa,  0.0%hi,  0.0%si,  0.0%st
+   #   Cpu1  :  0.7%us,  0.3%sy,  0.0%ni, 99.0%id,  0.0%wa,  0.0%hi,  0.0%si,  0.0%st
+   #   Cpu2  :  0.3%us,  0.0%sy,  0.0%ni, 99.7%id,  0.0%wa,  0.0%hi,  0.0%si,  0.0%st
+   #   Cpu3  :  0.0%us,  0.3%sy,  0.0%ni, 99.7%id,  0.0%wa,  0.0%hi,  0.0%si,  0.0%st
+   #   Cpu4  :  0.0%us,  0.0%sy,  0.0%ni,100.0%id,  0.0%wa,  0.0%hi,  0.0%si,  0.0%st
+   #   Cpu5  :  0.0%us,  0.0%sy,  0.0%ni,100.0%id,  0.0%wa,  0.0%hi,  0.0%si,  0.0%st
+   #
+   #
+   #
+   # HMC code level V7R7.5.0.0 has a bug in the monhmc command that prevents us from getting the CPU util
+   # It seems to be a bug in the monhmc script that looks for awk in the wrong location.
+   # Example: monhmc -r proc -n 0
+   #          /opt/hsc/bin/MONHmc: line 80: awk: command not found
+   # So, if the HMC code level is 7.7.5.0, just skip this subroutine
+   return if ( $hmc_version == 77500 );
+   #
+   #
+   $cmd = "$ssh $ssh_userid\@$host monhmc -r proc -n 0";	#define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      chomp $_;						#remove newline character
+      $cpu_count++; 					#increment counter
+      $cpu_user  = $cpu_user + $1 if ( $_ =~ /([0-9]+\.[0-9])\%us,/);
+      $cpu_sys   = $cpu_sys  + $1 if ( $_ =~ /([0-9]+\.[0-9])\%sy,/);
+      $cpu_nice  = $cpu_nice + $1 if ( $_ =~ /([0-9]+\.[0-9])\%ni,/);
+      $cpu_idle  = $cpu_idle + $1 if ( $_ =~ /([0-9]+\.[0-9])\%id,/);
+      $cpu_wait  = $cpu_wait + $1 if ( $_ =~ /([0-9]+\.[0-9])\%wa,/);
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+   #
+   # divide total by number of processors to get average CPU across all processors
+   $cpu_user  = $cpu_user / $cpu_count;
+   $cpu_sys   = $cpu_sys  / $cpu_count;
+   $cpu_nice  = $cpu_nice / $cpu_count;
+   $cpu_idle  = $cpu_idle / $cpu_count;
+   $cpu_wait  = $cpu_wait / $cpu_count;
+   # 
+   print "   CPU usage user:${cpu_user}\% sys:${cpu_sys}\% nice:${cpu_nice}\% idle:${cpu_idle}\% wait:${cpu_wait}\%  \n" if ($verbose eq "yes");
+   #
+   # alert if we could not find a value for cpu_idle
+   if ( ! defined ($cpu_idle) ) {	
+      print "$CHECK_NAME WARN - could not detect CPU utilization on HMC with:  monhmc -r proc -n 0 \n";
+      exit $WARN;
+   }								#end of if block
+   #
+   # alert if CPU is too busy (ie less than 50% idle)
+   if ($cpu_idle < 50 ) {
+      print "$CHECK_NAME WARN - high CPU utilization.  user=${cpu_user}\% sys=${cpu_sys}\% nice=${cpu_nice}\% idle=${cpu_idle}\% wait=${cpu_wait}\% \n";
+      exit $WARN;
+   }								#end of if block
+}								#end of subroutine
+
+
+
+sub check_hmc_memory {
+   #
+   print "running check_hmc_memory subroutine \n"      if ($verbose eq "yes");
+   #
+   # check the memory utilization on the HMC
+   # this will return output similar to: 
+   #   hscroot@hmc01:~> monhmc -r mem -n 0
+   #   Mem:   1034676k total,   995096k used,    39580k free,   147288k buffers
+   #
+   #
+   $cmd = "$ssh $ssh_userid\@$host monhmc -r mem -n 0";		#define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      if (/([0-9]+)k total, +([0-9]+)k used, +([0-9]+)k free,/) {
+         $mem_total = $1;					#assign to variable
+         $mem_used  = $2;					#assign to variable
+         $mem_free  = $3;					#assign to variable
+         #
+         $mem_free  = sprintf( "%.0f", $mem_free  / 1024 );	#convert from KB to MB
+         $mem_total = sprintf( "%.0f", $mem_total / 1024 );	#convert from KB to MB
+         $mem_used  = sprintf( "%.0f", $mem_used  / 1024 );	#convert from KB to MB
+         #
+         print "   found $mem_total MB total memory, $mem_used MB used, $mem_free MB free \n" if ($verbose eq "yes");
+      } 							#end of if block
+   } 								#end of while loop
+   close SSH; 							#close filehandle
+   #
+   #
+   # alert if we could not find a value for mem_free
+   if ( ! defined ($mem_free) ) {	
+      print "$CHECK_NAME WARN - could not detect free memory on HMC with:  monhmc -r mem -n 0 \n";
+      exit $WARN;
+   }								#end of if block
+   #
+   # alert if free memory is too low (less than 10MB)
+   if ($mem_free < 10 ) {	
+      print "$CHECK_NAME WARN - HMC low on memory.  Total:${mem_total}MB Used:${mem_used}MB Free:${mem_free}MB \n";
+      exit $WARN;
+   }								#end of if block
+}								#end of subroutine
+
+
+
+
+
+sub clear_bogus_serviceable_events {
+   #
+   print "running clear_bogus_serviceable_events subroutine \n"      if ($verbose eq "yes");
+   #
+   foreach $key (keys %managed_sys) { 				#loop through for each managed system
+      next unless $key;                     			#skip any blank lines
+      print "   checking for events on managed system $key \n" if ($verbose eq "yes");
+      $cmd = "$ssh $ssh_userid\@$host lssvcevents -m $key -t hardware -F problem_num,text --filter status=Open";		#define command to be run
+      print "   running $cmd \n" if ($verbose eq "yes");
+      open(SSH,"$cmd |") or die "$!\n";
+      while (<SSH>) {
+         #
+         # Please note that the following message is due to a bug in VIOS code levels 2.2.3.x and 2.2.4.x.
+         # Do not bother alerting the sysadmin in the event this message is found.  Just ignore this message.
+         # More details at http://www-01.ibm.com/support/docview.wss?uid=isg3T1023036
+         # 04/08/2017 10:57:09,"File System alert event occurred on /home/ios/CM/DB. Free space is less than 10%, or there was an error querying the filesystem."
+         #
+         if (/^([0-9]+),\"File System alert event occurred on \/home\/ios\/CM\/DB\. Free space is less than 10\%, or there was an error querying the filesystem\.\"/) {
+            $cmd = "$ssh $ssh_userid\@$host chsvcevent -o close -h $host -p $1";	#command to be run to close the bogus message
+            print "   running $cmd \n" if ($verbose eq "yes");
+            open(IN,"$cmd |") or die "$!\n";
+            while (<IN>) {
+               print "   closing serviceable event \n" if ($verbose eq "yes");
+            } 							#end of while loop
+            close IN;						#close filehandle
+         } 							#end of if block
+      } 							#end of while loop
+      close SSH;						#close filehandle
+   }								#end of foreach loop
+}								#end of subroutine
+
+
+
+
+
+sub managed_system_serviceable_events {
+   #
+   print "running managed_system_serviceable_events subroutine \n"      if ($verbose eq "yes");
+   #
+   # check for open serviceable events on all managed systems
+   #
+   # This command will generate output similar to the following if no open serviceable events are foundA
+   #   No results were found.
+   #
+   # This command will generate output similar to the following if open serviceable events are found:
+   #   01/18/2010 11:34:51,ACT04293I Power/Cooling subsystem & control (0x61) reported an error.
+   #   01/18/2010 11:35:12,ACT04293I Power/Cooling subsystem & control (0x61) reported an error.
+   #
+   foreach $key (keys %managed_sys) { 				#loop through for each managed system
+      next unless $key;                     			#skip any blank lines
+      print "   checking for events on managed system $key \n" if ($verbose eq "yes");
+      $cmd = "$ssh $ssh_userid\@$host lssvcevents -m $key -t hardware -F event_time,text --filter status=Open";		#define command to be run
+      print "   running $cmd \n" if ($verbose eq "yes");
+      open(SSH,"$cmd |") or die "$!\n";
+      while (<SSH>) {
+         if (/No results were found/) {
+            print "   no serviceable events were found for managed system $key \n" if ($verbose eq "yes");
+         } else {
+            print "$CHECK_NAME WARN - $key has open serviceable events.  Please check HMC for details, then close the events to clear this alert. $_  \n";
+            exit $WARN;
+         } 							#end of if/else block
+      } 							#end of while loop
+      close SSH; 						#close filehandle
+   }								#end of foreach loop
+   #
+   # This section checks for errors on the HMC itself (instead of errors on the managed systems)
+   # Note that we do not use the "-m managed_sys" switch, because we are looking for events on the HMC
+   print "   checking for events on the HMC \n" if ($verbose eq "yes");
+   $cmd = "$ssh $ssh_userid\@$host lssvcevents -t hardware -F event_time,text --filter status=Open";	#command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open(SSH,"$cmd |") or die "$!\n";
+   while (<SSH>) {
+      if (/No results were found/) {
+         print "   no serviceable events were found for the HMC \n" if ($verbose eq "yes");
+      } else {
+         print "$CHECK_NAME WARN - HMC has open serviceable events.  Please note that these are events on the HMC itself, not on a managed system.  Please check HMC for details, then close the events to clear this alert. \n";
+         exit $WARN;
+      } 							#end of if/else block
+   } 								#end of while loop
+   close SSH;							#close filehandle
+}								#end of subroutine
+
+
+
+
+
+sub managed_system_attention_light_status {
+   #
+   print "running managed_attention_light_status subroutine \n"      if ($verbose eq "yes");
+   #
+   # get the status of the system attention light for each managed system
+   #
+   # The output will look similar to:
+   #   hscroot@hmc2:~> lsled -r sa -t phys -F state -m 8231-E1C*06C4CXX
+   #   off
+   #
+   foreach $key (keys %managed_sys) { 				#loop through for each managed system
+      next unless $key;                     			#skip any blank lines
+      $cmd = "$ssh $ssh_userid\@$host lsled -r sa -t phys -F state -m $key";		#define command to be run
+      print "   running $cmd \n" if ($verbose eq "yes");
+      open(SSH,"$cmd |") or die "$!\n";
+      while (<SSH>) {
+         if ( /off/ ) {
+            print "   system attention light is off \n" if ($verbose eq "yes");
+         } elsif ( /on/ ) {
+            print "$CHECK_NAME WARN - system attention light illuminated on $key \n";
+            exit $WARN;
+         } else {
+            print "$CHECK_NAME WARN - could not determine state of system attention light on $key \n";
+            exit $WARN;
+         } 							#end of if/elsif/else
+      } 							#end of while loop
+      close SSH; 						#close filehandle
+   }								#end of foreach loop
+}								#end of subroutine
+
+
+
+
+sub managed_system_perfdata_collection {
+   #
+   print "running managed_system_perfdata_collection subroutine \n"      if ($verbose eq "yes");
+   #
+   # confirm the HMC is collecting perforance data (CPU/memory) from the hypervisor of each managed system
+   #
+   # If performance data collection is not enabled (which is the default), you will get output similar to.  The following.  Note sample_rate=0
+   #   hscroot@hmc01:~> lslparutil -m 9117-MMA*0686XXX -r config
+   #   type_model_serial_num=9117-MMA*06865B0,name=Server-9406-520-SN10BEXXX,sample_rate=0
+   #
+   # Performance data collection can be enabled with this command:  chlparutil -r config -m Server-8205-E6C-SN06DCX3R -s 60
+   # After enabling performance data collection, wait a few minutes, then you should get output similar to:
+   #   hscroot@hmc01:~> lslparutil -r sys -m Server-8205-E6C-SN06DXXX
+   #   time=09/12/2013 10:13:33,event_type=sample,resource_type=sys,sys_time=09/12/2013 10:13:23,primary_state=Started,detailed_state=None,configurable_sys_proc_units=8.0,configurable_sys_mem=262144,curr_avail_sys_proc_units=3.2,curr_avail_5250_cpw_percent=0.0,curr_avail_sys_mem=59392,sys_firmware_mem=13312,proc_cycles_per_second=512000000
+   #
+   #
+   #
+   foreach $key (keys %managed_sys) { 				#loop through for each managed system
+      next unless $key;                     			#skip any blank lines
+      $cmd = "$ssh $ssh_userid\@$host lslparutil -m $key -r config";			#define command to be run
+      print "   running $cmd \n" if ($verbose eq "yes");
+      open(SSH,"$cmd |") or die "$!\n";
+      while (<SSH>) {
+         if ( /sample_rate=0/ ) {
+            print "$CHECK_NAME WARN - performance data collection not enabled for managed system.  Please run this command on the HMC: chlparutil -r config -m $key -s 60 (can take up to 60 minutes for data to appear)\n";
+            exit $WARN;						#exit script
+         } elsif ( /sample_rate=([0-9]+)/ ) {
+            print "   performance data is being collected every $1 seconds \n" if ($verbose eq "yes");
+         } else {
+            print "$CHECK_NAME WARN - could not determine sample rate for performance data collection on a $key \n";
+            exit $WARN;
+         } 							#end of if/elsif/else
+      } 							#end of while loop
+      close SSH; 						#close filehandle
+   }								#end of foreach loop
+}								#end of subroutine
+
+
+
+
+
+
+sub all_clear {
+   #
+   print "running all_clear subroutine \n" if ($verbose eq "yes");
+   #
+   # we only get this far if there were no problems
+   #
+   print "$CHECK_NAME OK - All $managed_sys_num managed systems are running normally. ";
+   foreach $key (keys %managed_sys) {
+      print "$managed_sys{$key}{name} ";
+   }
+   print "\n";			
+   exit $OK;
+
+}                                                                       #end of subroutine
+
+
+
+
+
+# --  main body of script -------------------------------------------------
+sanity_checks;
+check_host_alive;
+ssh_to_hmc;
+get_hmc_version;
+get_managed_system_names;
+check_dns;
+check_hostname;
+check_time_sync;
+check_hmc_remote_access_settings;
+ping_each_managed_system_fsp;
+check_hmc_cpu;
