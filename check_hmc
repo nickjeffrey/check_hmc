@@ -794,7 +794,7 @@ sub check_firmware_update_key {
    #
    #
    print "   checking for the firmware update access key  \n" if ($verbose eq "yes");
-   $cmd = "$ssh $ssh_userid\@$host lssvcevents -t console -d 7";		#define command to be run
+   $cmd = "$ssh $ssh_userid\@$host lssvcevents -t console -d 1";		#define command to be run
    print "   running $cmd \n" if ($verbose eq "yes");
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
