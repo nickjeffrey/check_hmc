@@ -21,6 +21,7 @@
 #  2020/01/21	njeffrey	Update check_hmc_memory subroutine with new regex for HMC code level 8.8.7
 #  2020/07/31	njeffrey	Add --verbose switch
 #  2020/07/31	njeffrey	Add check_firmware_update_key subroutine
+#  2021/02/02	njeffrey	Update check_firmware_update_key subroutine.  Change -d 1 to -i 1440
 
 
 # OUTSTANDING TASKS
@@ -794,16 +795,16 @@ sub check_firmware_update_key {
    #
    #
    print "   checking for the firmware update access key  \n" if ($verbose eq "yes");
-   $cmd = "$ssh $ssh_userid\@$host lssvcevents -t console -d 1";		#define command to be run
+   $cmd = "$ssh $ssh_userid\@$host lssvcevents -t console -i 1440";		#define command to be run
    print "   running $cmd \n" if ($verbose eq "yes");
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
       if (/A7004760/) {
-         print "$CHECK_NAME WARN - Firmware update access key will expire in less than 30 days.  Please obtain a new key from http://www.ibm.com/servers/eserver/ess $_\n";
+         print "$CHECK_NAME WARN - Firmware update access key will expire in less than 30 days.  This message will disappear in 24 hours.  Please obtain a new key from http://www.ibm.com/servers/eserver/ess $_\n";
          exit $WARN;
       } 							#end of if/else block
       if (/A7004761/) {
-         print "$CHECK_NAME WARN - Firmware update access key has expired.  Please obtain a new key from http://www.ibm.com/servers/eserver/ess $_\n";
+         print "$CHECK_NAME WARN - Firmware update access key has expired.  This message will disappear in 24 hours.  Please obtain a new key from http://www.ibm.com/servers/eserver/ess $_\n";
          exit $WARN;
       } 							#end of if/else block
    } 							#end of while loop
