@@ -38,7 +38,19 @@ Are you sure you want to continue connecting (yes/no)? yes
 Warning: Permanently added 'unix07,10.2.2.62' (RSA) to the list of known hosts.
 ```
 
-4) You will need a section similar to the following in the commands.cfg file on the nagios server.
+4) You will need a section similar to the following in the services.cfg file on the nagios server.
+```
+      # Check IBM HMC to monitor IBM Power servers
+      define service{
+              use                             generic-24x7-service
+              host_name                       hmc1.example.com
+              service_description             HMC checks
+              check_command                   check_hmc
+      }
+```
+
+
+5) You will need a section similar to the following in the commands.cfg file on the nagios server.
 ```
  # 'check_hmc' command definition
  define command{
