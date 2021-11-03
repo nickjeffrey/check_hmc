@@ -56,7 +56,7 @@
 #
 #   3) You will need to manually ssh from the nagios server to each monitored HMC to update 
 #      the known_hosts file on the nagios server.  Example shown below:
-#         $ ssh hscroot@hmc01
+#         $ ssh nagios@hmc01
 #         WARNING: DSA key found for host hmc01
 #         in /home/nagios/.ssh/known_hosts2:3
 #         DSA key fingerprint d6:74:15:62:f3:09:31:09:65:a2:23:56:4b:e0:6b:16.
@@ -126,7 +126,7 @@ $managed_sys_num   = 0;						#initialize variable for number of managed systems
 $key               = "";					#initialize variable
 $host              = "";					#initialize variable
 $ssh               = "/usr/bin/ssh";       		        #location of ssh binary
-$ssh_userid        = "hscroot";                     		#username passed to remote host
+$ssh_userid        = "nagios";                     		#username passed to remote host
 $nslookup          = "/usr/bin/nslookup";			#location of binary on nagios server
 $ping              = "/bin/ping";				#location of binary on nagios server
 $nslookup_status   = "";					#flag for checking to see if nslookup test succeeds
