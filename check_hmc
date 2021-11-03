@@ -328,6 +328,25 @@ sub get_hmc_version {
    #   *RM V7R7.5.0.0            <--------- this is the code level of the HMC
    # "
    #
+   #
+   #   hscroot@hmc01:~> lshmc -F -v
+   #   "*FC ????????
+   #   *VC 20.0
+   #   *N2 Tue Nov 02 21:26:29 MDT 2021
+   #   *FC ????????
+   #   *DS Hardware Management Console
+   #   *TM 7063-CR1
+   #   *SE 1309XXX
+   #   *MN IBM
+   #   *PN N/A
+   #   *SZ 34202845184
+   #   *OS Embedded Operating Systems
+   #   *NA 10.9.15.147
+   #   *FC ????????
+   #   *DS Platform Firmware
+   #   *RM V9R1.931.0          <--------- this is the code level of the HMC
+   # "
+   #
    print "running get_hmc_version subroutine \n" if ($verbose eq "yes");
    #
    $cmd = "$ssh $ssh_userid\@$host lshmc -v";                 #define command to be run
@@ -336,7 +355,7 @@ sub get_hmc_version {
    while (<SSH>) {
       chomp $_;					#remove newline character from array element
       # HMC version 9 has four fields in the version number
-      if ( /^\*RM V([0-9]+)R([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/ ) {	#find the line containing the HMC code level
+      if ( /^\*RM V([0-9]+)R([0-9]+)\.([0-9]+)\.([0-9]+)$/ ) {	#find the line containing the HMC code level
          $hmc_version = "$1$2$3$4";				#change format from V9R1.940.0 to 919400 to make it easier to do math against the version number
       } 							#end of if block
       # HMC version 7 and 8 have five fields in the version number
