@@ -25,14 +25,15 @@ su - nagios
 ssh-keygen -t rsa
 cat $HOME/.ssh/id_rsa.pub
 ```
-On each HMC:
+Create a low-privilege read-only user account on  each HMC:
 ```
-hscroot@hmc "mkauthkeys --add 'public_key_string_goes_here'"
+ssh hscroot@hmc mkhmcusr -u nagios -a hmcviewer -d monitoring --passwd StrongPasswordGoesHere
+ssh nagios@hmc "mkauthkeys --add 'public_key_string_goes_here'"
 ```
 
 3) You will need to manually ssh from the nagios server to each monitored HMC to update the known_hosts file on the nagios server.  Example shown below:
 ```
-$ ssh hscroot@hmc01
+$ ssh nagios@hmc01
 RSA key fingerprint is ea:a1:05:58:8d:4e:4e:c4:82:db:cf:87:75:a6:7c:7f.
 Are you sure you want to continue connecting (yes/no)? yes
 Warning: Permanently added 'unix07,10.2.2.62' (RSA) to the list of known hosts.
