@@ -22,6 +22,8 @@
 #  2020/07/31	njeffrey	Add --verbose switch
 #  2020/07/31	njeffrey	Add check_firmware_update_key subroutine
 #  2021/02/02	njeffrey	Update check_firmware_update_key subroutine.  Change -d 1 to -i 1440
+#  2021/05/13	njeffrey	Update check_hmc_version subroutine because version 7 and 8 used five fields, but v9 only uses 4 fields
+#  2021/11/02	njeffrey	Documentation updates
 
 
 # OUTSTANDING TASKS
@@ -44,12 +46,13 @@
 #        On nagios server:
 #        ----------------    
 #           su - nagios
-#           ssh-keygen -t dsa
-#           cat $HOME/.ssh/id_dsa.pub
+#           ssh-keygen -t rsa
+#           cat $HOME/.ssh/id_rsa.pub
 #
-#        On each HMC
-#        -----------
-#           ssh hscroot@hmc "mkauthkeys --add 'public_key_string_goes_here'"
+#        On each HMC, create a low-privilege userid called nagios
+#        --------------------------------------------------------
+#           ssh hscroot@hmc mkhmcusr -u nagios -a hmcviewer -d monitoring --passwd StrongPasswordGoesHere
+#           ssh nagios@hmc  "mkauthkeys --add 'nagios_public_key_string_goes_here'" 
 #
 #   3) You will need to manually ssh from the nagios server to each monitored HMC to update 
 #      the known_hosts file on the nagios server.  Example shown below:
@@ -67,11 +70,20 @@
 #
 #   4) You will need a section similar to the following in the commands.cfg file on the nagios server.
 #      This defines the check_hmc command.
-#
 #      # 'check_hmc' command definition
 #      define command{
 #         command_name    check_hmc
 #         command_line    $USER1$/check_hmc $HOSTADDRESS$
+#      }
+#
+#   5) You will need a section similar to the following in the services.cfg file on the nagios server.
+#      This defines the check_hmc command.
+#      # Check IBM HMC to monitor IBM Power servers
+#      define service{
+#              use                             generic-24x7-service
+#              host_name                       hmc1.example.com
+#              service_description             HMC checks
+#              check_command                   check_hmc
 #      }
 
 
@@ -322,10 +334,16 @@ sub get_hmc_version {
    print "   running $cmd \n" if ($verbose eq "yes");
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
-      chomp $_;							#remove newline character from array element
+      chomp $_;					#remove newline character from array element
+      # HMC version 9 has four fields in the version number
       if ( /^\*RM V([0-9]+)R([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/ ) {	#find the line containing the HMC code level
-      $hmc_version = "$1$2$3$4$5";				#change format from V7R7.5.0.0 to 77500 to make it easier to do math against the version number
+         $hmc_version = "$1$2$3$4";				#change format from V9R1.940.0 to 919400 to make it easier to do math against the version number
       } 							#end of if block
+      # HMC version 7 and 8 have five fields in the version number
+      if ( /^\*RM V([0-9]+)R([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/ ) {	#find the line containing the HMC code level
+         $hmc_version = "$1$2$3$4$5";				#change format from V7R7.5.0.0 to 77500 to make it easier to do math against the version number
+      } 							#end of if block
+      
    } 								#end of while loop
    close SSH; 							#close filehandle
    #
