@@ -24,6 +24,7 @@
 #  2021/02/02	njeffrey	Update check_firmware_update_key subroutine.  Change -d 1 to -i 1440
 #  2021/05/13	njeffrey	Update check_hmc_version subroutine because version 7 and 8 used five fields, but v9 only uses 4 fields
 #  2021/11/02	njeffrey	Documentation updates
+#  2021/12/08	njeffrey	Write to temporary file to allow check to used cached results
 
 
 # OUTSTANDING TASKS
@@ -85,6 +86,13 @@
 #              service_description             HMC checks
 #              check_command                   check_hmc
 #      }
+#
+#   6) Schedule this script to run hourly from the nagios user crontab, which will update a file at /tmp/nagios.check_hmc.HOSTNAME.tmp
+#      This allows the script to run regularly, aWhen this script runs as the low-privileged nagios user, the script will read the contents of /tmp/nagios.check_unix_password_age.tmp
+#      Create cron entries in the root user crontab similar to the following:  (one for each vmware host)
+#       1 * * * * /usr/local/nagios/libexec/check_hmc hmc1.example.com   1>/dev/null 2>/dev/null  #nagios helper script
+#       2 * * * * /usr/local/nagios/libexec/check_hmc hmc2.example.com   1>/dev/null 2>/dev/null  #nagios helper script
+
 
 
 
@@ -95,8 +103,9 @@
 # 1) Confirm you can ssh from the nagios server to each monitored HMC without a password
 #    
 # 2) Confirm there are no firewalls preventing ssh logins from the nagios server to the HMC hosts
-#    
 #
+# 3) This command can take a long time:  lssvcevents -t console -i 1440
+#    If the above command takes more than 60 seconds, the nagios check will timeout, so by default, it reads from the cached file that is created by cron
 #    
 #
 # Usage:       /usr/local/nagios/libexec/check_hmc hostname
@@ -115,6 +124,8 @@ my (%managed_sys,$managed_sys_num,$key,$host);
 my ($ssh,$ssh_userid);
 my ($verbose);
 my ($nslookup,$nslookup_status,$ping,$ping_status,$cmd);
+my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+my ($common_output_data,$perf_data,$output_filename,$output_file_age,$output_message);
 my (%fsp,$fsp,$hmc_version,@nameservers);
 my ($cpu_user,$cpu_sys,$cpu_nice,$cpu_idle,$cpu_wait,$cpu_count,$mem_free,$mem_used,$mem_total);
 my ($opt_h,$opt_v);
@@ -139,6 +150,7 @@ $cpu_nice          = 0; 					#initialize variable
 $cpu_idle          = 0; 					#initialize variable
 $cpu_wait          = 0; 					#initialize variable
 $cpu_count         = 0;						#initialize variable
+$perf_data         = "";                               	  	#nagios performance data included in output
 $CHECK_NAME        = "HMC checks"; 				#name of nagios check
 #
 # Nagios return codes
@@ -231,6 +243,67 @@ sub sanity_checks {
 
 
 
+sub check_for_output_file {
+   #
+   # a cron job may have already created the output file that we need
+   #
+   print "running check_for_output_file subroutine \n" if ($verbose eq "yes");
+   #
+   $output_filename = "/tmp/nagios.check_hmc.$host.tmp";
+   #
+   # delete the output file if it is more than 1 hours (3600 seconds) old
+   if ( -e $output_filename ) {                                                 #see if a cron job has already provided the info we need
+      ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($output_filename); #get last modification time in seconds since the epoch
+      $output_file_age = time - $mtime;                                         #figure out how many seconds old the file is
+      print "   output file $output_filename is $output_file_age seconds old \n" if ($verbose eq "yes");
+      if( $output_file_age >= 3600 ) {                                         #see if the file is more than 3600 seconds old
+         print "   deleting old copy of $output_filename \n" if ($verbose eq "yes");
+         unlink "$output_filename";                                             #delete the file if it is too old
+      }                                                                         #end of if block
+   }                                                                            #end of if block
+   #
+   if ( -e "$output_filename" ) {                                               #see if a cron job has already provided the info we need
+      open (OUT,"$output_filename") or die "Cannot open $output_filename for reading $! \n";
+      while (<OUT>) {                                                           #read a line from the text file
+         $output_message = $_  if ( $_ =~ /[a-zA-Z]/);                          #get the content of the output file into a variable
+         print "   output message is $output_message \n" if ($verbose eq "yes");
+      }                                                                         #end of while loop
+      close OUT;                                                                #close filehandle
+      print $output_message;                                                    #print the content of the output file
+      exit $CRITICAL if ( $output_message =~ /CRITICAL/ );                      #exit script with appropriate return code
+      exit $WARN     if ( $output_message =~ /WARN/ );                          #exit script with appropriate return code
+      exit $UNKNOWN  if ( $output_message =~ /UNKNOWN/ );                       #exit script with appropriate return code
+      exit $OK       if ( $output_message =~ /OK/ );                            #exit script with appropriate return code
+   }                                                                            #end of if block
+}                                                                               #end of subroutine
+
+
+
+
+sub print_to_outputfile {
+   #
+   print "running print_to_outputfile \n" if ($verbose eq "yes");
+   #
+   # This subroutine is called whenever an output message is printed, to confirm that the $output_file exists
+   #
+   # confirm the output message exists
+   $output_message = "$CHECK_NAME UNKNOWN - could not parse response from remote host \n" unless ($output_message);
+   #
+   # confirm the $output_filename variable is defined
+   unless ($output_filename) {
+      $output_message = "$CHECK_NAME UNKNOWN - the \$output_filename variable is not defined.  This might be a script bug. | $perf_data \n";
+      print "$output_message";                                       		#print output to screen
+      exit $UNKNOWN;                                                            #only get this far if OK/WARN/CRITICAL/UNKNOWN was not found in the output file
+   }                                                                            #end of unless block
+   #
+   if ( ! -e "$output_filename" ) {                                             #only run this section if $output_filename does not already exist
+      print "   $output_filename not found - writing output message to $output_filename \n" if ($verbose eq "yes");
+      open (OUT,">$output_filename") or die "Cannot open $output_filename for writing: $! \n";
+      print OUT "$output_message";
+      close OUT;                                                                #close filehandle
+      chmod 0644, "$output_filename";                                           #set the file permission to -rw-r--r-- to ensure nagios user can read file
+   }                                                                            #end of if block
+}                                                                               #end of subroutine
 
 
 sub check_host_alive {   
@@ -253,7 +326,9 @@ sub check_host_alive {
    }										#end of while loop
    close NSLOOKUP;								#close filehandle
    if ( $nslookup_status eq "failed" ) {					#check for flag value
-      print "$CHECK_NAME CRITICAL: no name resolution for $host - please add $host to DNS \n";
+      $output_message = "$CHECK_NAME CRITICAL: no name resolution for $host - please add $host to DNS | $perf_data \n";
+      print "$output_message";                                       		#print output to screen
+      print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
       exit $CRITICAL;
    }										#end of if block
    #
@@ -261,7 +336,9 @@ sub check_host_alive {
    #
    $ping_status = "";								#initialize variable
    if( ! open( PING, "$ping -c 1 $host |" ) ) {
-      print "$CHECK_NAME CRITICAL - Could not ping $host because: $!\n";
+      $output_message = "$CHECK_NAME CRITICAL - Could not ping $host because: $! | $perf_data \n";
+      print "$output_message";                                       		#print output to screen
+      print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
       exit $CRITICAL;
    }
    while (<PING>) {								#read a line from STDIN
@@ -270,7 +347,9 @@ sub check_host_alive {
    }										#end of while loop
    close PING;									#close filehandle
    if ( $ping_status eq "failed" ) {						#check for flag value
-      print "$CHECK_NAME CRITICAL - No ping reply from $host $!\n";
+      $output_message = "$CHECK_NAME CRITICAL - No ping reply from $host $! | $perf_data \n";
+      print "$output_message";                                       		#print output to screen
+      print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
       exit $CRITICAL;
    }										#end of if block
 }
@@ -292,7 +371,9 @@ sub ssh_to_hmc {
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
       unless ( /[a-zA-Z0-9\"\*]+/ ) {				#look for some output to confirm the SSH login worked
-         print "$CHECK_NAME WARN - Could not login to the HMC via SSH.  Please confirm SSH key pairs setup with the mkauthkeys command on the HMC.\n";
+         $output_message = "$CHECK_NAME WARN - Could not login to the HMC via SSH.  Please confirm SSH key pairs setup with the mkauthkeys command on the HMC. | $perf_data \n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       } 							#end of if block
    } 								#end of while loop
@@ -309,7 +390,8 @@ sub get_hmc_version {
    #
    # figure out the code level running on the HMC 
    #
-   # The "lshmc -v" command will return output similar to the following:
+   # The "lshmc -F -v" command will return output similar to the following:
+   #
    #   hscroot@hmc01:~> lshmc -F -v
    #   "*FC ????????
    #   *VC 20.0
@@ -327,8 +409,7 @@ sub get_hmc_version {
    #   *DS Platform Firmware
    #   *RM V7R7.5.0.0            <--------- this is the code level of the HMC
    # "
-   #
-   #
+   # 
    #   hscroot@hmc01:~> lshmc -F -v
    #   "*FC ????????
    #   *VC 20.0
@@ -347,6 +428,15 @@ sub get_hmc_version {
    #   *RM V9R1.931.0          <--------- this is the code level of the HMC
    # "
    #
+   #
+   #
+   #
+   #
+   #
+   #
+   #
+   #
+   #
    print "running get_hmc_version subroutine \n" if ($verbose eq "yes");
    #
    $cmd = "$ssh $ssh_userid\@$host lshmc -v";                 #define command to be run
@@ -354,13 +444,15 @@ sub get_hmc_version {
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
       chomp $_;					#remove newline character from array element
-      # HMC version 9 has four fields in the version number
+      # HMC version 9 has four fields in the version number 
       if ( /^\*RM V([0-9]+)R([0-9]+)\.([0-9]+)\.([0-9]+)$/ ) {	#find the line containing the HMC code level
          $hmc_version = "$1$2$3$4";				#change format from V9R1.940.0 to 919400 to make it easier to do math against the version number
+         print "   HMC version $hmc_version \n" if ($verbose eq "yes");
       } 							#end of if block
       # HMC version 7 and 8 have five fields in the version number
       if ( /^\*RM V([0-9]+)R([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/ ) {	#find the line containing the HMC code level
          $hmc_version = "$1$2$3$4$5";				#change format from V7R7.5.0.0 to 77500 to make it easier to do math against the version number
+         print "   HMC version $hmc_version \n" if ($verbose eq "yes");
       } 							#end of if block
       
    } 								#end of while loop
@@ -368,7 +460,9 @@ sub get_hmc_version {
    #
    # warn if HMC version was not found
    if ( ! defined ($hmc_version) ) {				#could not find HMC version
-      print "$CHECK_NAME WARN - Could not determine HMC software version from output of lshmc -v command. \n";
+      $output_message = "$CHECK_NAME WARN - Could not determine HMC software version from output of lshmc -v command. | $perf_data \n";
+      print "$output_message";                                       		#print output to screen
+      print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
       exit $WARN;
    }								#end of if block
 }								#end of subroutine
@@ -403,7 +497,9 @@ sub get_managed_system_names {
    #
    # warn if there are no managed systems detected
    if ( $managed_sys_num == 0 ) {				#zero managed systems were detected
-      print "$CHECK_NAME WARN - $managed_sys_num managed systems were detected on $host.  The HMC may have lost communication with the managed systems over the private network. \n";
+      $output_message = "$CHECK_NAME WARN - $managed_sys_num managed systems were detected on $host.  The HMC may have lost communication with the managed systems over the private network. | $perf_data  \n";
+      print "$output_message";                                       		#print output to screen
+      print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
       exit $WARN;
    }								#end of if block
    #
@@ -425,7 +521,9 @@ sub get_managed_system_names {
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
       if ( /([a-zA-Z0-9_\-\*]+),Failed Authentication/ ) {	#look for systems with Failed Authentication
-         print "$CHECK_NAME WARN - The HMC has not authenticated with managed system $1.  The managed system might be new, or the HMC may have recently had a code update.  Open the HMC interface, right click on this managed system, then enter the authentication password. \n";
+         $output_message = "$CHECK_NAME WARN - The HMC has not authenticated with managed system $1.  The managed system might be new, or the HMC may have recently had a code update.  Open the HMC interface, right click on this managed system, then enter the authentication password. | $perf_data \n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       } 							#end of if block
    } 								#end of while loop
@@ -455,7 +553,9 @@ sub check_dns {
          @nameservers = split (/,/,$_); 			#put each nameserver into an array element
       }								#end of if block
       unless ( /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ ) {		#if there are no DNS servers defined
-         print "$CHECK_NAME WARN - $host is not configured to use DNS for name resolution.  Please add name servers to $host \n";
+         $output_message = "$CHECK_NAME WARN - $host is not configured to use DNS for name resolution.  Please add name servers to $host | $perf_data \n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       }								#end of unless block
    } 								#end of while loop
@@ -471,12 +571,16 @@ sub check_dns {
       open(SSH,"$cmd |") or die "$!\n";
       while (<SSH>) {
          if ( /0 received/ ) {						#look for ping reply from DNS server
-            print "$CHECK_NAME WARN - no ping reply from $host to DNS server $_.  Please check to confirm the HMC is using valid nameservers.\n";
+            $output_message = "$CHECK_NAME WARN - no ping reply from $host to DNS server $_.  Please check to confirm the HMC is using valid nameservers. | $perf_data \n";
+            print "$output_message";                                       		#print output to screen
+            print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
             exit $WARN;
          } elsif ( /1 received/ ) {
             print "   received ping reply from DNS server \n" if ($verbose eq "yes");
          } else {
-            print "$CHECK_NAME WARN - did not recognize response to ping sent to DNS server \n";
+            $output_message = "$CHECK_NAME WARN - did not recognize response to ping sent to DNS server | $perf_data \n";
+            print "$output_message";                                       		#print output to screen
+            print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
             exit $WARN;
          } 								#end of if/elsif/else block
       } 								#end of while loop
@@ -502,11 +606,15 @@ sub check_hostname {
          print "   found hostname $1 \n" if ($verbose eq "yes");
       }								#end of if block
       if ( /\./ ) {						#look for a . character in hostname
-         print "$CHECK_NAME WARN - $host hostname contains a dot (.) character.  The dot should be in the domain name.\n";
+         $output_message = "$CHECK_NAME WARN - $host hostname contains a dot (.) character.  The dot should be in the domain name. | $perf_data \n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       }								#end of if block
       unless ( /[a-zA-Z0-9\-]+/ ) {
-         print "$CHECK_NAME WARN - $host does not have a hostname configured.  Please fix up in HMC config.\n";
+         $output_message = "$CHECK_NAME WARN - $host does not have a hostname configured.  Please fix up in HMC config. | $perf_data \n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       }								#end of unless block
    } 								#end of while loop
@@ -528,7 +636,9 @@ sub check_time_sync {
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
       unless ( /enable/ ) {					#check to see if ntp is enabled
-         print "$CHECK_NAME WARN - $host does not have xntp enabled, so HMC is not synchronizing time against an NTP server.\n";
+         $output_message = "$CHECK_NAME WARN - $host does not have xntp enabled, so HMC is not synchronizing time against an NTP server. | $perf_data \n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       }								#end of if block
    } 								#end of while loop
@@ -545,7 +655,9 @@ sub check_time_sync {
          chomp;							#remove newline
          print "   found NTP server $_ \n" if ($verbose eq "yes");
       } else {							#only get here if no NTP servers were found
-         print "$CHECK_NAME WARN - $host has NTP client enabled, but does not have a list of NTP servers to sync time against.\n";
+         $output_message = "$CHECK_NAME WARN - $host has NTP client enabled, but does not have a list of NTP servers to sync time against. | $perf_data \n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       }								#end of if/else block
    } 								#end of while loop
@@ -569,7 +681,9 @@ sub check_hmc_remote_access_settings {
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
       unless ( /enable/ ) {					#check to see if ntp is enabled
-         print "$CHECK_NAME WARN - $host does not permit remote access via ssh.  Please fix up on HMC console.\n";
+         $output_message = "$CHECK_NAME WARN - $host does not permit remote access via ssh.  Please fix up on HMC console. | $perf_data \n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       }								#end of if block
    } 								#end of while loop
@@ -584,7 +698,9 @@ sub check_hmc_remote_access_settings {
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
       unless ( /enable/ ) {					#check to see if ntp is enabled
-         print "$CHECK_NAME WARN - $host does not permit web-based remote access.  This means you cannot use your web browser to manage the HMC at https://$host.  Please fix up on HMC console.\n";
+         $output_message = "$CHECK_NAME WARN - $host does not permit web-based remote access.  This means you cannot use your web browser to manage the HMC at https://$host.  Please fix up on HMC console. | $perf_data \n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       }								#end of if block
    } 								#end of while loop
@@ -633,12 +749,16 @@ sub ping_each_managed_system_fsp {
       open(SSH,"$cmd |") or die "$!\n";
       while (<SSH>) {
          if ( /0 received/ ) {					#look for ping reply from DNS server
-            print "$CHECK_NAME WARN - no ping reply from $host to service processor $fsp.  HMC may have lost communication with managed system over private network.\n";
+            $output_message = "$CHECK_NAME WARN - no ping reply from $host to service processor $fsp.  HMC may have lost communication with managed system over private network. | $perf_data \n";
+            print "$output_message";                                       		#print output to screen
+            print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
             exit $WARN;
          } elsif ( /1 received/ ) {
             print "   received ping reply from service processor \n" if ($verbose eq "yes");
          } else {
-            print "$CHECK_NAME WARN - did not recognize response to ping sent to service processor \n";
+            $output_message = "$CHECK_NAME WARN - did not recognize response to ping sent to service processor | $perf_data \n";
+            print "$output_message";                                       		#print output to screen
+            print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
             exit $WARN;
          } 							#end of if/elsif/else block
       } 							#end of while loop
@@ -707,13 +827,17 @@ sub check_hmc_cpu {
    #
    # alert if we could not find a value for cpu_idle
    if ( ! defined ($cpu_idle) ) {	
-      print "$CHECK_NAME WARN - could not detect CPU utilization on HMC with:  monhmc -r proc -n 0 \n";
+      $output_message = "$CHECK_NAME WARN - could not detect CPU utilization on HMC with:  monhmc -r proc -n 0 | $perf_data \n";
+      print "$output_message";                                       		#print output to screen
+      print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
       exit $WARN;
    }								#end of if block
    #
    # alert if CPU is too busy (ie less than 50% idle)
    if ($cpu_idle < 50 ) {
-      print "$CHECK_NAME WARN - high CPU utilization.  user=${cpu_user}\% sys=${cpu_sys}\% nice=${cpu_nice}\% idle=${cpu_idle}\% wait=${cpu_wait}\% \n";
+      $output_message = "$CHECK_NAME WARN - high CPU utilization.  user=${cpu_user}\% sys=${cpu_sys}\% nice=${cpu_nice}\% idle=${cpu_idle}\% wait=${cpu_wait}\% | $perf_data \n";
+      print "$output_message";                                       		#print output to screen
+      print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
       exit $WARN;
    }								#end of if block
 }								#end of subroutine
@@ -766,13 +890,17 @@ sub check_hmc_memory {
    #
    # alert if we could not find a value for mem_free
    if ( ! defined ($mem_free) ) {	
-      print "$CHECK_NAME WARN - could not detect free memory on HMC with:  monhmc -r mem -n 0 \n";
+      $output_message = "$CHECK_NAME WARN - could not detect free memory on HMC with:  monhmc -r mem -n 0 | $perf_data \n";
+      print "$output_message";                                       		#print output to screen
+      print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
       exit $WARN;
    }								#end of if block
    #
    # alert if free memory is too low (less than 10MB)
    if ($mem_free < 10 ) {	
-      print "$CHECK_NAME WARN - HMC low on memory.  Total:${mem_total}MB Used:${mem_used}MB Free:${mem_free}MB \n";
+      $output_message = "$CHECK_NAME WARN - HMC low on memory.  Total:${mem_total}MB Used:${mem_used}MB Free:${mem_free}MB | $perf_data \n";
+      print "$output_message";                                       		#print output to screen
+      print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
       exit $WARN;
    }								#end of if block
 }								#end of subroutine
@@ -837,11 +965,15 @@ sub check_firmware_update_key {
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
       if (/A7004760/) {
-         print "$CHECK_NAME WARN - Firmware update access key will expire in less than 30 days.  This message will disappear in 24 hours.  Please obtain a new key from http://www.ibm.com/servers/eserver/ess $_\n";
+         $output_message = "$CHECK_NAME WARN - Firmware update access key will expire in less than 30 days.  This message will disappear in 24 hours.  Please obtain a new key from http://www.ibm.com/servers/eserver/ess $_\n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       } 							#end of if/else block
       if (/A7004761/) {
-         print "$CHECK_NAME WARN - Firmware update access key has expired.  This message will disappear in 24 hours.  Please obtain a new key from http://www.ibm.com/servers/eserver/ess $_\n";
+         $output_message = "$CHECK_NAME WARN - Firmware update access key has expired.  This message will disappear in 24 hours.  Please obtain a new key from http://www.ibm.com/servers/eserver/ess $_\n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       } 							#end of if/else block
    } 							#end of while loop
@@ -873,7 +1005,9 @@ sub managed_system_serviceable_events {
          if (/No results were found/) {
             print "   no serviceable events were found for managed system $key \n" if ($verbose eq "yes");
          } else {
-            print "$CHECK_NAME WARN - $key has open serviceable events.  Please check HMC for details, then close the events to clear this alert. $_  \n";
+            $output_message = "$CHECK_NAME WARN - $key has open serviceable events.  Please check HMC for details, then close the events to clear this alert. $_  | $perf_data \n";
+            print "$output_message";                                       		#print output to screen
+            print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
             exit $WARN;
          } 							#end of if/else block
       } 							#end of while loop
@@ -890,7 +1024,9 @@ sub managed_system_serviceable_events {
       if (/No results were found/) {
          print "   no serviceable events were found for the HMC \n" if ($verbose eq "yes");
       } else {
-         print "$CHECK_NAME WARN - HMC has open serviceable events.  Please note that these are events on the HMC itself, not on a managed system.  Please check HMC for details, then close the events to clear this alert. \n";
+         $output_message = "$CHECK_NAME WARN - HMC has open serviceable events.  Please note that these are events on the HMC itself, not on a managed system.  Please check HMC for details, then close the events to clear this alert. \n";
+         print "$output_message";                                       		#print output to screen
+         print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
          exit $WARN;
       } 							#end of if/else block
    } 								#end of while loop
@@ -920,10 +1056,14 @@ sub managed_system_attention_light_status {
          if ( /off/ ) {
             print "   system attention light is off \n" if ($verbose eq "yes");
          } elsif ( /on/ ) {
-            print "$CHECK_NAME WARN - system attention light illuminated on $key \n";
+            $output_message = "$CHECK_NAME WARN - system attention light illuminated on $key \n";
+            print "$output_message";                                       		#print output to screen
+            print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
             exit $WARN;
          } else {
-            print "$CHECK_NAME WARN - could not determine state of system attention light on $key \n";
+            $output_message = "$CHECK_NAME WARN - could not determine state of system attention light on $key \n";
+            print "$output_message";                                       		#print output to screen
+            print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
             exit $WARN;
          } 							#end of if/elsif/else
       } 							#end of while loop
@@ -958,12 +1098,16 @@ sub managed_system_perfdata_collection {
       open(SSH,"$cmd |") or die "$!\n";
       while (<SSH>) {
          if ( /sample_rate=0/ ) {
-            print "$CHECK_NAME WARN - performance data collection not enabled for managed system.  Please run this command on the HMC: chlparutil -r config -m $key -s 60 (can take up to 60 minutes for data to appear)\n";
+            $output_message = "$CHECK_NAME WARN - performance data collection not enabled for managed system.  Please run this command on the HMC: chlparutil -r config -m $key -s 60 (can take up to 60 minutes for data to appear)\n";
+            print "$output_message";                                       		#print output to screen
+            print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
             exit $WARN;						#exit script
          } elsif ( /sample_rate=([0-9]+)/ ) {
             print "   performance data is being collected every $1 seconds \n" if ($verbose eq "yes");
          } else {
-            print "$CHECK_NAME WARN - could not determine sample rate for performance data collection on a $key \n";
+            $output_message = "$CHECK_NAME WARN - could not determine sample rate for performance data collection on a $key | $perf_data \n";
+            print "$output_message";                                       		#print output to screen
+            print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
             exit $WARN;
          } 							#end of if/elsif/else
       } 							#end of while loop
@@ -982,15 +1126,15 @@ sub all_clear {
    #
    # we only get this far if there were no problems
    #
-   print "$CHECK_NAME OK - All $managed_sys_num managed systems are running normally. ";
+   $output_message = "$CHECK_NAME OK - all $managed_sys_num managed systems are running normally. ";
    foreach $key (keys %managed_sys) {
-      print "$managed_sys{$key}{name} ";
+      $output_message = "$output_message $managed_sys{$key}{name} ";		#append the name of each managed system to the message
    }
-   print "\n";			
+   $output_message = "$output_message | $perf_data \n";				#append perfdata to the message
+   print "$output_message";                                       		#print output to screen
+   print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
    exit $OK;
-
 }                                                                       #end of subroutine
-
 
 
 
@@ -998,6 +1142,7 @@ sub all_clear {
 # --  main body of script -------------------------------------------------
 get_options;
 sanity_checks;
+check_for_output_file;
 check_host_alive;
 ssh_to_hmc;
 get_hmc_version;
