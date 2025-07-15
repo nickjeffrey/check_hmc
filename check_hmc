@@ -25,6 +25,7 @@
 #  2021/05/13	njeffrey	Update check_hmc_version subroutine because version 7 and 8 used five fields, but v9 only uses 4 fields
 #  2021/11/02	njeffrey	Documentation updates
 #  2021/12/08	njeffrey	Write to temporary file to allow check to used cached results
+#  2025/07/14	njeffrey	enhance ping logic
 
 
 # OUTSTANDING TASKS
@@ -262,6 +263,23 @@ sub check_for_output_file {
       }                                                                         #end of if block
    }                                                                            #end of if block
    #
+   # 
+   # delete the output file if it contains "Permission denied"
+   # This would indicate there was a ping timeout due to potential network issue,
+   # so delete the file and wait for the cron job to try to ping again.
+   #
+   #
+   if ( -e "$output_filename" ) {                                               #see if a cron job has already provided the info we need
+      open (OUT,"$output_filename") or die "Cannot open $output_filename for reading $! \n";
+      while (<OUT>) {                                                           #read a line from the text file
+         if ( (/Could not ping/) || (/No ping reply/) ) {
+            print "   deleting old copy of $output_filename due to ping failure \n" if ($verbose eq "yes");
+            unlink "$output_filename";                                          #delete the file if it is too old
+         }                                                                      #end of if block
+      }                                                                         #end of while loop
+      close OUT;                                                                #close filehandle
+   }                                                                            #end of if block
+   #                                                    
    if ( -e "$output_filename" ) {                                               #see if a cron job has already provided the info we need
       open (OUT,"$output_filename") or die "Cannot open $output_filename for reading $! \n";
       while (<OUT>) {                                                           #read a line from the text file
@@ -335,7 +353,7 @@ sub check_host_alive {
    # ping remote hostname 
    #
    $ping_status = "";								#initialize variable
-   if( ! open( PING, "$ping -c 1 $host |" ) ) {
+   if( ! open( PING, "$ping -c 10 $host |" ) ) {
       $output_message = "$CHECK_NAME CRITICAL - Could not ping $host because: $! | $perf_data \n";
       print "$output_message";                                       		#print output to screen
       print_to_outputfile;                                           		#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
