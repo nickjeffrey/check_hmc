@@ -66,7 +66,7 @@ Warning: Permanently added 'unix07,10.2.2.62' (RSA) to the list of known hosts.
 nagios
 
 $ crontab -l
-1,16,31,46 * * * * /usr/local/nagios/libexec/check_hmc hmc01.example.com  1>/dev/null 2>/dev/null  #nagios helper script
+1,16,31,46 * * * * /usr/local/nagios/libexec/check_hmc hmc01.example.com 1>/dev/null 2>/dev/null  #nagios helper script
 2,17,32,47 * * * * /usr/local/nagios/libexec/check_hmc hmc02.example.com 1>/dev/null 2>/dev/null  #nagios helper script
 ```
 
