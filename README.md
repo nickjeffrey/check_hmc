@@ -60,3 +60,10 @@ Warning: Permanently added 'unix07,10.2.2.62' (RSA) to the list of known hosts.
    }
 ```
 
+# Sample Output
+```
+HMC checks OK - all 2 managed systems are running normally.  9009-22A*7803XXX  9009-22A*7803YYY
+```
+```
+HMC checks WARN - managed system 9009-22A*7803XXX has open serviceable events, please investigate.
+```
