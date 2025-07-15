@@ -77,3 +77,6 @@ HMC checks OK - all 2 managed systems are running normally.  9009-22A*7803XXX  9
 ```
 HMC checks WARN - managed system 9009-22A*7803XXX has open serviceable events, please investigate.
 ```
+```
+HMC checks WARN - system attention light illuminated on managed system 9009-22A*7803XXX , please investigate.
+```
