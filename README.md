@@ -60,6 +60,16 @@ Warning: Permanently added 'unix07,10.2.2.62' (RSA) to the list of known hosts.
    }
 ```
 
+6) These checks can sometimes take longer than 60 seconds to run, which can cause nagios timeouts.  Schedule the check to run every 15 minutes from the nagios user crontab, and cached output will be used.  For example:
+```
+ $ whoami
+nagios
+
+$ crontab -l
+1,16,31,46 * * * * /usr/local/nagios/libexec/check_hmc hmc01.example.com  1>/dev/null 2>/dev/null  #nagios helper script
+2,17,32,47 * * * * /usr/local/nagios/libexec/check_hmc hmc02.example.com 1>/dev/null 2>/dev/null  #nagios helper script
+```
+
 # Sample Output
 ```
 HMC checks OK - all 2 managed systems are running normally.  9009-22A*7803XXX  9009-22A*7803YYY
