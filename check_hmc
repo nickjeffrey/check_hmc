@@ -26,6 +26,7 @@
 #  2021/11/02	njeffrey	Documentation updates
 #  2021/12/08	njeffrey	Write to temporary file to allow check to used cached results
 #  2025/07/14	njeffrey	enhance ping logic
+#  2026/03/26	njeffrey	Add /usr/bin/timeout (Linux only, not AIX) to timeout long-running commands that sometimes hang
 
 
 # OUTSTANDING TASKS
@@ -124,6 +125,7 @@ use Getopt::Long; 	                                      #allow --long-switches 
 my (%managed_sys,$managed_sys_num,$key,$host);
 my ($ssh,$ssh_userid);
 my ($verbose);
+my ($timeout);
 my ($nslookup,$nslookup_status,$ping,$ping_status,$cmd);
 my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
 my ($common_output_data,$perf_data,$output_filename,$output_file_age,$output_message);
@@ -140,6 +142,7 @@ $host              = "";					#initialize variable
 $ssh               = "/usr/bin/ssh";       		        #location of ssh binary
 $ssh_userid        = "nagios";                     		#username passed to remote host
 $nslookup          = "/usr/bin/nslookup";			#location of binary on nagios server
+$timeout           = "/usr/bin/timeout";			#location of binary on nagios server
 $ping              = "/bin/ping";				#location of binary on nagios server
 $nslookup_status   = "";					#flag for checking to see if nslookup test succeeds
 $ping_status       = "";					#flag for checking to see if ping     test succeeds
@@ -217,6 +220,20 @@ sub sanity_checks {
    if ( ! -x "$nslookup" ) {
       print "ERROR: $nslookup is not executable by the current user\n";
       exit;					#exit script
+   }						#end of if block
+   #
+   # confirm timeout exists (will exist on Linux, but not AIX)
+   $timeout = "/bin/timeout"     if (-f "/bin/timeout");	
+   $timeout = "/usr/bin/timeout" if (-f "/usr/bin/timeout");	
+   if ( (-f "$timeout") && (! -x "$timeout") ) {
+      print "ERROR: $timeout exists but is not executable by the current user\n";
+      exit;					#exit script
+   }						#end of if block
+   if ( (! -f "/bin/timeout") && (! -f "/usr/bin/timeout") ) {
+      #we should only get here if nagios server is running AIX
+      #set value to empty so we can still call in a command later even on AIX
+      #this means the timeout command will work on Linux, but fail gracefully on AIX
+      $timeout = "";   				
    }						#end of if block
    #
    # confirm ping exists
@@ -978,7 +995,11 @@ sub check_firmware_update_key {
    #
    #
    print "   checking for the firmware update access key  \n" if ($verbose eq "yes");
-   $cmd = "$ssh $ssh_userid\@$host lssvcevents -t console -i 1440";		#define command to be run
+   if ( (-f "/bin/timeout") || (-f "/usr/bin/timeout") ) {
+      $cmd = "$timeout 300 $ssh $ssh_userid\@$host lssvcevents -t console -i 1440";		#this command sometimes hangs indefinitely, kill after 300 seconds
+   } else {
+      $cmd = "$ssh $ssh_userid\@$host lssvcevents -t console -i 1440";				#define command to be run if the timeout command does not exist
+   }
    print "   running $cmd \n" if ($verbose eq "yes");
    open(SSH,"$cmd |") or die "$!\n";
    while (<SSH>) {
